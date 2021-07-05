@@ -13,8 +13,6 @@ function tryDecode(
   }
 }
 
-type CookieMatchType = 'equals';
-
 interface Cookie {
   domain?: string;
   expires?: number;
@@ -34,7 +32,6 @@ interface CookieStoreDeleteOptions {
 interface CookieStoreGetOptions {
   name?: string;
   url?: string;
-  matchType?: CookieMatchType;
 }
 
 interface ParseOptions {
@@ -52,7 +49,7 @@ interface CookieListItem {
   value?: string;
   domain: string | null;
   path?: string;
-  expires: number | null;
+  expires: Date | number | null;
   secure?: boolean;
   sameSite?: CookieSameSite;
 }
@@ -120,8 +117,8 @@ class CookieChangeEvent extends Event {
     eventInitDict: CookieChangeEventInit = { changed: [], deleted: [] }
   ) {
     super(type, eventInitDict);
-    this.changed = eventInitDict.changed;
-    this.deleted = eventInitDict.deleted;
+    this.changed = eventInitDict.changed || [];
+    this.deleted = eventInitDict.deleted || [];
   }
 }
 
@@ -177,11 +174,6 @@ class CookieStore extends EventTarget {
       if (item.domain && item.domain !== window.location.hostname) {
         throw new TypeError('Cookie domain must domain-match current host');
       }
-      if (item.name === '' && item.value && item.value.includes('=')) {
-        throw new TypeError(
-          "Cookie value cannot contain '=' if the name is empty"
-        );
-      }
 
       if (item.path && item.path.endsWith('/')) {
         item.path = item.path.slice(0, -1);
@@ -189,6 +181,16 @@ class CookieStore extends EventTarget {
       if (item.path === '') {
         item.path = '/';
       }
+    }
+
+    if (item.name === '' && item.value && item.value.includes('=')) {
+      throw new TypeError(
+        "Cookie value cannot contain '=' if the name is empty"
+      );
+    }
+
+    if (item.name && item.name.startsWith('__Host')) {
+      item.path = '/';
     }
 
     // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
@@ -204,9 +206,12 @@ class CookieStore extends EventTarget {
 
     if (typeof item.expires === 'number') {
       cookieString += '; Expires=' + new Date(item.expires).toUTCString();
+    } else if (item.expires instanceof Date) {
+      cookieString += '; Expires=' + item.expires.toUTCString();
     }
 
-    if (item.secure) {
+    if ((item.name && item.name.startsWith('__Secure')) || item.secure) {
+      item.sameSite = CookieSameSite.lax;
       cookieString += '; Secure';
     }
 
@@ -245,13 +250,8 @@ class CookieStore extends EventTarget {
     init?: CookieStoreGetOptions['name'] | CookieStoreGetOptions
   ): Promise<Cookie[]> {
     const cookies = parse(document.cookie);
-    if (!init || Object.keys(init).length === 0) {
+    if (init == null || Object.keys(init).length === 0) {
       return cookies;
-    }
-    if (init == null) {
-      throw new TypeError('CookieStoreGetOptions must not be empty');
-    } else if (init instanceof Object && !Object.keys(init).length) {
-      throw new TypeError('CookieStoreGetOptions must not be empty');
     }
     let name: string | undefined;
     let url;
@@ -298,10 +298,94 @@ class CookieStore extends EventTarget {
   }
 }
 
+interface CookieStoreGetOptions {
+  name?: string;
+  url?: string;
+}
+
+const workerSubscriptions = new WeakMap<
+  CookieStoreManager,
+  CookieStoreGetOptions[]
+>();
+
+const registrations = new WeakMap<
+  CookieStoreManager,
+  ServiceWorkerRegistration
+>();
+
+class CookieStoreManager {
+  get [Symbol.toStringTag]() {
+    return 'CookieStoreManager';
+  }
+
+  constructor() {
+    throw new TypeError('Illegal Constructor');
+  }
+
+  async subscribe(subscriptions: CookieStoreGetOptions[]): Promise<void> {
+    const currentSubcriptions = workerSubscriptions.get(this) || [];
+    const worker = registrations.get(this);
+    if (!worker) throw new TypeError('Illegal invocation');
+    for (const subscription of subscriptions) {
+      const name = subscription.name;
+      const url = new URL(subscription.url || '', worker.scope).toString();
+
+      if (currentSubcriptions.some((x) => x.name === name && x.url === url))
+        continue;
+      currentSubcriptions.push({
+        name: subscription.name,
+        url,
+      });
+    }
+    workerSubscriptions.set(this, currentSubcriptions);
+  }
+
+  async getSubscriptions(): Promise<CookieStoreGetOptions[]> {
+    return (workerSubscriptions.get(this) || []).map(({ name, url }) => ({
+      name,
+      url,
+    }));
+  }
+
+  async unsubscribe(subscriptions: CookieStoreGetOptions[]): Promise<void> {
+    let currentSubcriptions = workerSubscriptions.get(this) || [];
+
+    const worker = registrations.get(this);
+    if (!worker) throw new TypeError('Illegal invocation');
+
+    for (const subscription of subscriptions) {
+      const name = subscription.name;
+      // TODO: Parse the url with the relevant settings objects API base URL.
+      // https://wicg.github.io/cookie-store/#CookieStoreManager-unsubscribe
+      const url = new URL(subscription.url || '', worker.scope).toString();
+      currentSubcriptions = currentSubcriptions.filter((x) => {
+        if (x.name !== name) return true;
+        if (x.url !== url) return true;
+        return false;
+      });
+    }
+    workerSubscriptions.set(this, currentSubcriptions);
+  }
+}
+
+if (!ServiceWorkerRegistration.prototype.cookies) {
+  Object.defineProperty(ServiceWorkerRegistration.prototype, 'cookies', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      const manager = Object.create(CookieStoreManager.prototype);
+      registrations.set(manager, this);
+      Object.defineProperty(this, 'cookies', { value: manager });
+      return manager;
+    },
+  });
+}
+
 if (!window.cookieStore) {
   window.CookieStore = CookieStore;
   window.cookieStore = Object.create(CookieStore.prototype);
   window.CookieChangeEvent = CookieChangeEvent;
+  window.CookieStoreManager = CookieStoreManager;
 }
 
 declare global {
@@ -309,6 +393,10 @@ declare global {
     CookieStore: typeof CookieStore;
     cookieStore: CookieStore;
     CookieChangeEvent: typeof CookieChangeEvent;
+    CookieStoreManager: typeof CookieStoreManager;
+  }
+  interface ServiceWorkerRegistration {
+    cookies: CookieStoreManager;
   }
 }
 
